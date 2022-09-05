@@ -1,0 +1,289 @@
+---
+title: "Course Project"
+author: "Amos Turin"
+date: "2022-08-30"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+### Load packages
+
+```{r, results='hide'}
+library(ggplot2)
+library(dplyr)
+library(caret)
+library(randomForest)
+library(xgboost)
+library(lubridate)
+library(corrplot)
+```
+
+### Load the datasets
+
+```{r}
+training <- read.csv("https://d396qusza40orc.cloudfront.net/predmachlearn/pml-training.csv",
+                     na.strings = c("", "NA"))
+
+testing <- read.csv("https://d396qusza40orc.cloudfront.net/predmachlearn/pml-testing.csv",
+                    na.strings = c("", "NA"))
+
+```
+
+### Quick look at the dataset
+
+```{r}
+head(training)
+```
+
+It seems the variables of this data set are either numeric or character.
+Some of the numerics are actually datetime, some of the chars should actually be numeric.
+The outcome variable class should be a factor, along with user_name, new_window, and num_window.
+so there is quite a bit of preprocessing here.
+
+```{r}
+numerics <- which(sapply(training, is.numeric))
+chrs <- which(sapply(training, is.character))
+
+print(paste("data has", dim(training)[2], "Variables"))
+print(paste("of which", dim(training[,numerics])[2], "are numeric"))
+print(paste("and", dim(training[,chrs])[2], "are character"))
+
+```
+Let's take a quick look at the outcome variable classe
+
+```{r, fig.width=4, fig.height=3}
+ggplot(training, aes(x = as.factor(classe), fill = classe)) +
+      geom_bar() +
+      ggtitle("Distribution of Classe") +
+      xlab("Classe")
+```
+
+Before preprocessing I'll take a quick look at the missing values situation as I
+can already, at first glance, notice many missing values in the data.
+
+```{r}
+nas <- sapply(training, function(x) sum(is.na(x)))
+nas[nas>0]
+```
+
+Ok, so 100 of the 160 variables have almost 98% missing values. With such a high 
+proportion of missing values I don't think imputation would provide any useful information
+for the classification stage so I will go ahead and remove these variables
+
+```{r}
+cols_to_drop <- names(nas[nas==19216])
+training <- training %>% select(-c(cols_to_drop))
+testing <- testing %>% select(-c(cols_to_drop))
+```
+Just a quick confirmation that the missing value situation is sorted
+
+```{r}
+nastrn <- sapply(training, function(x) sum(is.na(x)))
+nastst <- sapply(testing, function(x) sum(is.na(x)))
+
+print(paste("train NAs:", length(nastrn[nastrn>0]),
+                                 "test NAs:", length(nastst[nastst>0])))
+```
+### PreProcessing the data
+
+I'll combine the train/test datasets for a quick preprocessing before splitting 
+them again for the modelling phase
+
+```{r}
+testing$classe <- NA
+# testing$problem_id is essentially a duplication of testing$X so I will drop it
+testing <- testing %>% select(-problem_id)
+
+df <- rbind(training, testing)
+
+dim(df)
+```
+Converting datetime columns from numeric to datetime
+
+```{r}
+# raw_timestamp_part_1 and raw_timestamp_part_2
+# I will create a new variable with the date and time of each observation
+df$dateTimeStamp <- as.POSIXct(df$raw_timestamp_part_1, origin="1970-01-01")
+
+# cvtd_timestamp is a character class and provides data up to the minute
+df$cvtd_timestamp <- as.POSIXct(df$cvtd_timestamp, format = "%d/%m/%Y %H:%M")
+
+# Not sure what raw_timeStamp_part_2 means so going to remove it for this analysis
+# and as cvtd_timestamp does not contains less information than the new dateTimeStamp
+# I will drop this as well
+df <- df %>% select(-c(raw_timestamp_part_1, raw_timestamp_part_2, cvtd_timestamp))
+
+```
+
+Converting categorical variables to factors
+
+```{r}
+to_convert_fac <- c("user_name", "new_window", "classe")
+
+to_convert_num <- c("total_accel_arm", "total_accel_belt", "total_accel_forearm",
+                "total_accel_dumbbell", "num_window")
+
+df <- df %>%
+      mutate_at(to_convert_fac, as.factor) %>%
+      mutate_at(to_convert_num, as.numeric) %>%
+      select(-c(new_window))
+```
+
+### Split the datsets back into training and testing prior to further exploration
+
+```{r}
+training <- df %>%
+      filter(is.na(classe)==FALSE) %>%
+      select(-X)
+
+testing <- df %>%
+      filter(is.na(classe)==TRUE) %>%
+      select(-X)
+
+```
+
+### Split the training set into train/test in order to have a validation set for the model
+
+```{r}
+set.seed(1234)
+inTrain <- createDataPartition(y = training$classe, p = 0.75, list=FALSE)
+
+train <- training[inTrain,]
+test <- training[-inTrain,]
+```
+
+
+### Modelling
+
+I'll start by applying KNN classification. 
+As KNN becomes exponentially more costly on large dimension data I will apply PCA
+to reduce the number of predictors and make the model more computationally efficient.
+
+I'll use cross-validation in order to train and test my model using varying subsets
+of the data to optimize my final model's performance when making predictions on unseen data.
+
+For each of the repetitions I will try to find the optimal K from a set of potential Ks
+outlined in the tuneGrid parameter.
+
+After tuning the model for the first time, I achieve the best accuracy when k=3.
+
+```{r}
+# Start with a baseline classification model of KNN
+
+set.seed(1234)
+
+ctrl <- trainControl(method="repeatedcv",
+                     repeats = 2,
+                     number = 3,
+                     preProcOptions = list(pcaComp = 7),
+                     verboseIter = T) 
+
+knnFit <- train(classe ~ ., data = train,
+                method = "knn",
+                trControl = ctrl,
+                preProcess = c("center","scale", "pca"),
+                tuneGrid = expand.grid(k = c(3, 5, 7, 9, 11, 13, 15)))
+
+#Output of kNN fit
+knnFit
+```
+
+```{r}
+plot(knnFit)
+```
+
+```{r}
+knnPredict <- predict(knnFit,newdata = test)
+```
+
+Surprisingly, the accuracy on my test set is higher than on the train set.
+This may mean I am underfitting my model and need to increase its expressibility.
+I can try to do this by removing the PCA used to preProcess the model.
+Or alternatively, I may need to fit a different classification model.
+
+```{r}
+confusionMatrix(knnPredict, test$classe)
+```
+### KNN take=2
+
+This time I will try fitting the model without PCA to increase the model expressibility.
+
+```{r}
+set.seed(1234)
+
+ctrl <- trainControl(method="repeatedcv",
+                     repeats = 2,
+                     number = 3,
+                     verboseIter = T) 
+
+knnFit2 <- train(classe ~ ., data = train,
+                method = "knn",
+                trControl = ctrl,
+                preProcess = c("center","scale"),
+                tuneGrid = expand.grid(k = c(3, 5, 7, 9)))
+
+#Output of kNN fit
+knnFit2
+```
+```{r}
+plot(knnFit2)
+```
+
+
+
+```{r}
+predictions <- predict(knnFit2, test)
+
+confusionMatrix(predictions, test$classe)
+```
+
+Before concluding I will try to use a different classification model to compare results.
+In this case I will use a Random Forest model.
+
+```{r}
+set.seed(1234)
+
+ctrl <- trainControl(method="repeatedcv",
+                     repeats = 2,
+                     number = 4,
+                     verboseIter = F,
+                     search = "grid") 
+
+RanForFit <- train(classe ~ ., data = train,
+                method = "rf",
+                metric = "Accuracy",
+                trControl = ctrl,
+                tuneGrid = expand.grid(.mtry = (5:8)))
+
+#Output of kNN fit
+RanForFit
+```
+```{r}
+plot(RanForFit)
+```
+
+
+
+```{r}
+predictRF <- predict(RanForFit, test)
+
+confusionMatrix(predictRF, test$classe)
+```
+
+Random forest results in almost perfect prediction. I will use this model to predict 
+classes for the unseen testing dataset
+
+```{r}
+finalPred <- predict(RanForFit, testing)
+
+finalPred
+```
+
+
+
+
+
+
